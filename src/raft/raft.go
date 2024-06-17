@@ -90,11 +90,12 @@ func (rf *Raft) GetState() (int, bool) {
 	var isleader bool
 	// Your code here (3A).
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
 	term = rf.currentTerm
 	if rf.state == LEADER {
 		isleader = true
 	}
-	rf.mu.Unlock()
 	return term, isleader
 }
 
@@ -163,8 +164,9 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
-	if args.Term >= rf.currentTerm {
+	if args.Term >= rf.currentTerm && rf.votedFor == args.LeaderId {
 		rf.currentTerm = args.Term
+		rf.state = FOLLOWER
 		rf.followerChannel <- FOLLOWER
 		reply.Success = true
 		return
@@ -191,6 +193,7 @@ func (rf *Raft) sendAppendEntries() {
 					results <- reply.Success
 					if reply.Term > rf.currentTerm {
 						rf.currentTerm = reply.Term
+						rf.state = FOLLOWER
 						rf.followerChannel <- FOLLOWER
 					}
 				} else {
@@ -206,13 +209,15 @@ func (rf *Raft) sendAppendEntries() {
 		if result {
 			count = count + 1
 			if count > len(rf.peers)/2 {
+				rf.state = LEADER
 				rf.leaderChannel <- LEADER
-				break
+				return
 			}
 		}
 	}
 	if count <= len(rf.peers)/2 {
 		//fmt.Printf("count %v len(rf.peers)/2 %v \n", count, len(rf.peers)/2)
+		rf.state = FOLLOWER
 		rf.followerChannel <- FOLLOWER
 	}
 
@@ -315,6 +320,7 @@ func (rf *Raft) sendRequestVote() {
 		if result {
 			count = count + 1
 			if count > len(rf.peers)/2 {
+				rf.state = LEADER
 				rf.leaderChannel <- LEADER
 				go rf.sendAppendEntries()
 				break
@@ -394,6 +400,7 @@ func (rf *Raft) ticker() {
 			time.Sleep(time.Microsecond * 10)
 			go rf.sendAppendEntries()
 		case <-time.After(time.Duration(150+(rand.Int63()%300)) * time.Millisecond):
+			rf.state = CANDIDATE
 			rf.candidateChannel <- CANDIDATE
 		}
 		// Your code here (3A)
