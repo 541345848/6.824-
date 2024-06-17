@@ -168,27 +168,20 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm && rf.votedFor == args.LeaderId {
-		reply.Success = false
+	if args.Term > rf.currentTerm || args.Term == rf.currentTerm && rf.votedFor == args.LeaderId {
+		rf.mu.Lock()
+		rf.currentTerm = args.Term
+		rf.state = FOLLOWER
+		rf.mu.Unlock()
+		rf.followerChannel <- FOLLOWER
+		reply.Success = true
 		return
 	}
-
-	if len(rf.log) > 0 {
-		for index, entry := range rf.log {
-			if entry.Term == args.PrevLogTerm && index == args.PrevLogIndex {
-				//log.Printf("%v=%v %v=%v", args.PrevLogIndex, index, entry.Term, args.PrevLogTerm)
-				log.Printf("%v", args.Entries)
-				rf.log = append(rf.log, args.Entries...)
-			}
-		}
-	} else {
-		rf.log = append(rf.log, args.Entries...)
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
 	}
 
-	rf.currentTerm = args.Term
-	rf.state = FOLLOWER
-	rf.followerChannel <- FOLLOWER
-	reply.Success = true
+	reply.Success = false
 	return
 
 	//log.Printf("term %v %v append from %v\n", rf.currentTerm, rf.me, args.LeaderId)
@@ -196,22 +189,22 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 func (rf *Raft) sendAppendEntries() {
 	results := make(chan bool, len(rf.peers))
+	rf.mu.Lock()
+	prevLogTerm := 0
+	if len(rf.log) != 0 {
+		prevLogTerm = rf.log[len(rf.log)-1].Term
+	}
+	args := AppendEntriesArgs{
+		Term:         rf.currentTerm,
+		LeaderId:     rf.me,
+		PrevLogIndex: len(rf.log),
+		PrevLogTerm:  prevLogTerm,
+		LeaderCommit: rf.commitIndex,
+	}
+	//log.Printf("entry %v", args)
+	rf.mu.Unlock()
 	for server := 0; server < len(rf.peers); server++ {
-		rf.mu.Lock()
-		prevLogTerm := 0
-		if len(rf.log) != 0 {
-			prevLogTerm = rf.log[len(rf.log)-1].Term
-		}
-		args := AppendEntriesArgs{
-			Term:         rf.currentTerm,
-			LeaderId:     rf.me,
-			PrevLogIndex: len(rf.log),
-			PrevLogTerm:  prevLogTerm,
-			Entries:      rf.log[rf.nextIndex[server]:],
-			LeaderCommit: rf.commitIndex,
-		}
-		//log.Printf("entry %v", args)
-		rf.mu.Unlock()
+		args.Entries = rf.log[rf.nextIndex[server]:]
 		var reply AppendEntriesReply
 		if server != rf.me {
 			go func(args *AppendEntriesArgs, reply *AppendEntriesReply, server int) {
@@ -229,22 +222,28 @@ func (rf *Raft) sendAppendEntries() {
 			}(&args, &reply, server)
 		}
 	}
-	count := 1
+	count_t := 1
+	count_f := len(rf.peers) - 1
 	for i := 0; i < len(rf.peers)-1; i++ {
 		result := <-results // 接收一个返回值
 		if result {
-			count = count + 1
-			if count > len(rf.peers)/2 {
+			count_t = count_t + 1
+			if count_t > len(rf.peers)/2 {
 				rf.state = LEADER
+				//log.Printf("term %v, %v be leader", args.Term, args.LeaderId)
 				rf.leaderChannel <- LEADER
 				return
 			}
+		} else {
+			count_f = count_f - 1
+			if count_f <= len(rf.peers)/2 {
+				//fmt.Printf("count %v len(rf.peers)/2 %v \n", count, len(rf.peers)/2)
+				rf.state = FOLLOWER
+				rf.followerChannel <- FOLLOWER
+				return
+			}
+
 		}
-	}
-	if count <= len(rf.peers)/2 {
-		//fmt.Printf("count %v len(rf.peers)/2 %v \n", count, len(rf.peers)/2)
-		rf.state = FOLLOWER
-		rf.followerChannel <- FOLLOWER
 	}
 
 }
@@ -275,14 +274,12 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	defer rf.mu.Unlock()
 	reply.Term = rf.currentTerm
 	if (rf.currentTerm == args.Term && rf.votedFor == -1) || args.Term > rf.currentTerm {
-		//rf.followerChannel <- FOLLOWER
+		rf.followerChannel <- FOLLOWER
+		rf.state = FOLLOWER
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 		reply.VoteGranted = true
 		return
-	}
-	if args.Term > rf.currentTerm {
-		rf.currentTerm = args.Term
 	}
 	reply.VoteGranted = false
 }
@@ -434,7 +431,7 @@ func (rf *Raft) ticker() {
 			//log.Printf("i got leader %v", rf.me)
 			time.Sleep(time.Microsecond * 10)
 			go rf.sendAppendEntries()
-		case <-time.After(time.Duration(150+(rand.Int63()%300)) * time.Millisecond):
+		case <-time.After(time.Duration(200+(rand.Int63()%300)) * time.Millisecond):
 			rf.state = CANDIDATE
 			rf.candidateChannel <- CANDIDATE
 		}
@@ -483,6 +480,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	go rf.print()
+	//go rf.print()
 	return rf
 }
