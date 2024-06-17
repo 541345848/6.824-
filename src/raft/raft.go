@@ -44,7 +44,6 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
-
 	// For 3D:
 	SnapshotValid bool
 	Snapshot      []byte
@@ -58,6 +57,11 @@ const (
 	LEADER
 )
 
+type Entry struct {
+	Cmd  interface{}
+	Term int
+}
+
 // A Go object implementing a single Raft peer.
 type Raft struct {
 	mu          sync.Mutex          // Lock to protect shared access to this peer's state
@@ -67,7 +71,7 @@ type Raft struct {
 	dead        int32               // set by Kill()
 	currentTerm int
 	votedFor    int
-	log         []string
+	log         []Entry
 	commitIndex int
 	lastApplied int
 
@@ -152,7 +156,7 @@ type AppendEntriesArgs struct {
 	LeaderId     int
 	PrevLogIndex int
 	PrevLogTerm  int
-	Entries      []int
+	Entries      []Entry
 	LeaderCommit int
 }
 
@@ -164,27 +168,50 @@ type AppendEntriesReply struct {
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	reply.Term = rf.currentTerm
-	if args.Term >= rf.currentTerm && rf.votedFor == args.LeaderId {
-		rf.currentTerm = args.Term
-		rf.state = FOLLOWER
-		rf.followerChannel <- FOLLOWER
-		reply.Success = true
+	if args.Term < rf.currentTerm && rf.votedFor == args.LeaderId {
+		reply.Success = false
 		return
 	}
-	reply.Success = false
+
+	if len(rf.log) > 0 {
+		for index, entry := range rf.log {
+			if entry.Term == args.PrevLogTerm && index == args.PrevLogIndex {
+				//log.Printf("%v=%v %v=%v", args.PrevLogIndex, index, entry.Term, args.PrevLogTerm)
+				log.Printf("%v", args.Entries)
+				rf.log = append(rf.log, args.Entries...)
+			}
+		}
+	} else {
+		rf.log = append(rf.log, args.Entries...)
+	}
+
+	rf.currentTerm = args.Term
+	rf.state = FOLLOWER
+	rf.followerChannel <- FOLLOWER
+	reply.Success = true
+	return
 
 	//log.Printf("term %v %v append from %v\n", rf.currentTerm, rf.me, args.LeaderId)
 }
 
 func (rf *Raft) sendAppendEntries() {
 	results := make(chan bool, len(rf.peers))
-	rf.mu.Lock()
-	args := AppendEntriesArgs{
-		Term:     rf.currentTerm,
-		LeaderId: rf.me,
-	}
-	rf.mu.Unlock()
 	for server := 0; server < len(rf.peers); server++ {
+		rf.mu.Lock()
+		prevLogTerm := 0
+		if len(rf.log) != 0 {
+			prevLogTerm = rf.log[len(rf.log)-1].Term
+		}
+		args := AppendEntriesArgs{
+			Term:         rf.currentTerm,
+			LeaderId:     rf.me,
+			PrevLogIndex: len(rf.log),
+			PrevLogTerm:  prevLogTerm,
+			Entries:      rf.log[rf.nextIndex[server]:],
+			LeaderCommit: rf.commitIndex,
+		}
+		//log.Printf("entry %v", args)
+		rf.mu.Unlock()
 		var reply AppendEntriesReply
 		if server != rf.me {
 			go func(args *AppendEntriesArgs, reply *AppendEntriesReply, server int) {
@@ -202,7 +229,6 @@ func (rf *Raft) sendAppendEntries() {
 			}(&args, &reply, server)
 		}
 	}
-
 	count := 1
 	for i := 0; i < len(rf.peers)-1; i++ {
 		result := <-results // 接收一个返回值
@@ -344,10 +370,19 @@ func (rf *Raft) sendRequestVote() {
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
-	isLeader := true
-
+	isLeader := false
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.state == LEADER {
+		isLeader = true
+	}
+	if !isLeader {
+		return index, term, isLeader
+	}
+	term = rf.currentTerm
+	index = len(rf.log)
+	rf.log = append(rf.log, Entry{Term: term, Cmd: command})
 	// Your code here (3B).
-
 	return index, term, isLeader
 }
 
@@ -373,7 +408,7 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) print() {
 	for {
 		time.Sleep(time.Second * 1)
-		log.Printf("term %v raft %v state %v", rf.currentTerm, rf.me, rf.state)
+		log.Printf("term %v log %v", rf.currentTerm, rf.log)
 	}
 
 }
@@ -429,15 +464,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	//persistent state
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = []string{}
+	rf.log = []Entry{}
 
 	//volatile state on server
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
 	//volatile state on leaders
-	rf.nextIndex = []int{}
-	rf.matchIndex = []int{}
+	rf.nextIndex = make([]int, len(rf.peers), len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers), len(rf.peers))
 	rf.state = FOLLOWER
 	// Your initialization code here (3A, 3B, 3C).
 	rf.followerChannel = make(chan int, len(rf.peers))
@@ -448,6 +483,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.readPersist(persister.ReadRaftState())
 	// start ticker goroutine to start elections
 	go rf.ticker()
-	//go rf.print()
+	go rf.print()
 	return rf
 }
