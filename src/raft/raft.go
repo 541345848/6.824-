@@ -23,6 +23,7 @@ import (
 	"bytes"
 	"log"
 	"math/rand"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -225,7 +226,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.state = FOLLOWER
 			rf.log = append(rf.log[:max(args.PrevLogIndex, 0)], args.Entries...)
 			rf.persist()
-			rf.commitIndex = args.LeaderCommit
+			rf.commitIndex = max(args.LeaderCommit, rf.commitIndex)
 			rf.followerChannel <- FOLLOWER
 			reply.Success = true
 			reply.LogSuccess = true
@@ -238,7 +239,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 					rf.state = FOLLOWER
 					rf.log = append(rf.log[:max(args.PrevLogIndex, 0)], args.Entries...)
 					rf.persist()
-					rf.commitIndex = args.LeaderCommit
+					rf.commitIndex = max(args.LeaderCommit, rf.commitIndex)
 					rf.followerChannel <- FOLLOWER
 					reply.Success = true
 					reply.LogSuccess = true
@@ -294,6 +295,7 @@ func (rf *Raft) sendAppendEntries() {
 					rf.mu.Lock()
 					if reply.Success {
 						rf.nextIndex[server] = max(reply.NextIndex, rf.nextIndex[server])
+						rf.matchIndex[rf.me] = max(rf.matchIndex[server], args.PrevLogIndex+len(args.Entries))
 						rf.matchIndex[server] = max(rf.matchIndex[server], args.PrevLogIndex+len(args.Entries))
 					} else {
 						//rf.nextIndex[server] = max(rf.nextIndex[server]-1, 0)
@@ -306,7 +308,6 @@ func (rf *Raft) sendAppendEntries() {
 						rf.state = FOLLOWER
 						rf.persist()
 						rf.mu.Unlock()
-						rf.followerChannel <- FOLLOWER
 					}
 				} else {
 					results <- false
@@ -317,23 +318,31 @@ func (rf *Raft) sendAppendEntries() {
 
 	count_t := 1
 	count_f := len(rf.peers) - 1
+	rf.mu.Lock()
+	tmpslice := make([]int, len(rf.matchIndex))
+	copy(rf.matchIndex, tmpslice)
+	sort.Ints(tmpslice)
+	rf.mu.Unlock()
+
 	for i := 0; i < len(rf.peers)-1; i++ {
 		result := <-results // 接收一个返回值
-		if rf.currentTerm != term || rf.state != LEADER {
-			return
-		}
 		if result {
 			count_t = count_t + 1
 			if count_t > len(rf.peers)/2 {
 				rf.mu.Lock()
-				rf.state = LEADER
-				if len(log) > 0 && log[len(log)-1].Term == term {
-					rf.commitIndex = max(len(log), rf.commitIndex)
+				if !(rf.currentTerm != term || rf.state != LEADER) {
+					rf.state = LEADER
+				}
+				if len(log) > 0 && (log[len(log)-1].Term == term || tmpslice[0] > rf.commitIndex) {
+					rf.commitIndex = max(max(len(log), rf.commitIndex), tmpslice[0])
 					//fmt.Printf("leader %v,commitIndex %v\n", rf.me, rf.commitIndex)
 				}
-				//log.Printf("term %v, %v be leader", args.Term, args.LeaderId)
-				rf.persist()
 				rf.mu.Unlock()
+
+				//log.Printf("term %v, %v be leader", args.Term, args.LeaderId)
+				if rf.currentTerm != term || rf.state != LEADER {
+					return
+				}
 				rf.leaderChannel <- LEADER
 				break
 			}
@@ -346,25 +355,10 @@ func (rf *Raft) sendAppendEntries() {
 				rf.votedFor = -1
 				rf.persist()
 				rf.mu.Unlock()
-				rf.followerChannel <- FOLLOWER
 				break
 			}
 		}
 	}
-	/*
-		count_l := 1
-		for i := 0; i < len(rf.peers)-1; i++ {
-			result := <-l_results
-			if result {
-				count_l = count_l + 1
-				if count_l > len(rf.peers)/2 {
-					rf.mu.Lock()
-
-					//rf.persist()
-					rf.mu.Unlock()
-				}
-			}
-		}*/
 
 }
 
@@ -404,10 +398,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		((rf.currentTerm == args.Term && rf.votedFor == -1) ||
 			args.Term > rf.currentTerm) {
 		rf.state = FOLLOWER
+		rf.followerChannel <- FOLLOWER
 		rf.votedFor = args.CandidateId
 		rf.currentTerm = args.Term
 		rf.persist()
-		rf.followerChannel <- FOLLOWER
 		reply.VoteGranted = true
 		return
 	}
@@ -491,6 +485,7 @@ func (rf *Raft) sendRequestVote() {
 	}
 	count_t := 1
 	count_f := len(rf.peers) - 1
+
 	for i := 0; i < len(rf.peers)-1; i++ {
 		result := <-results // 接收一个返回值
 		if rf.currentTerm != term || rf.state != CANDIDATE {
@@ -518,7 +513,6 @@ func (rf *Raft) sendRequestVote() {
 				rf.state = FOLLOWER
 				rf.persist()
 				rf.mu.Unlock()
-				rf.followerChannel <- FOLLOWER
 				return
 			}
 		}
@@ -556,7 +550,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.mu.Unlock()
 	index = len(rf.log)
 	//go rf.sendAppendEntries()
-
 	//log.Printf("%v %v %v", index, term, isLeader)
 	// Your code here (3B).
 	return index, term, isLeader
@@ -637,7 +630,7 @@ func (rf *Raft) ticker() {
 			//log.Printf("i got leader %v", rf.me)
 			time.Sleep(time.Millisecond * 50)
 			go rf.sendAppendEntries()
-		case <-time.After(time.Duration(150+(rand.Int63()%300)) * time.Millisecond):
+		case <-time.After(time.Duration(300+(rand.Int63()%300)) * time.Millisecond):
 			rf.mu.Lock()
 			rf.state = CANDIDATE
 			rf.currentTerm = rf.currentTerm + 1
